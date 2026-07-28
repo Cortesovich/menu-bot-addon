@@ -112,6 +112,26 @@ def after_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("« Выбрать другое блюдо", callback_data="home")]])
 
 
+def confirm_kb(ci, di):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"ok:{ci}:{di}")],
+        [InlineKeyboardButton("« Назад", callback_data=f"c:{ci}")],
+    ])
+
+
+def dish_card(cuisine, dish):
+    lines = [f"🍽 <b>{dish['name']}</b>", f"Кухня: {cuisine}", "", "<b>Ингредиенты:</b>"]
+    for ing in dish["ingredients"]:
+        lines.append(f"• {ing['name']} — {ing['amount']}")
+    lines.append("")
+    lines.append(
+        f"Порций: {dish.get('portions','?')} · "
+        f"{dish.get('kcal_per_portion','?')} ккал/порц · "
+        f"возраст {dish.get('age','?')}"
+    )
+    return "\n".join(lines)
+
+
 # ----------------------------- хендлеры -----------------------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -149,16 +169,23 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("d:"):
+        # показать карточку блюда с составом и кнопками подтверждения
         _, ci, di = data.split(":")
         ci, di = int(ci), int(di)
         dish = MENU["cuisines"][ci]["dishes"][di]
         cuisine = MENU["cuisines"][ci]["title"]
+        text = dish_card(cuisine, dish) + "\n\nГотовим это блюдо?"
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=confirm_kb(ci, di))
+        return
 
-        # приятное сообщение выбравшему
+    if data.startswith("ok:"):
+        # подтверждение: приятное сообщение выбравшему + заказ владельцу
+        _, ci, di = data.split(":")
+        ci, di = int(ci), int(di)
+        dish = MENU["cuisines"][ci]["dishes"][di]
+        cuisine = MENU["cuisines"][ci]["title"]
         nice = random.choice(NICE).format(dish=dish["name"])
         await q.edit_message_text(f"{nice}", reply_markup=after_kb())
-
-        # сообщение владельцу: название + ингредиенты
         await notify_owner(ctx, cuisine, dish, chosen_by=q.from_user)
         return
 
