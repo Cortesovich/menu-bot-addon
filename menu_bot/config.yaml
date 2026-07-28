@@ -1,0 +1,22 @@
+name: "Домашнее меню — бот"
+version: "1.0.0"
+slug: menu_bot
+description: "Телеграм-бот домашнего меню: жена выбирает кухню и блюдо, владельцу приходит название и список ингредиентов."
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+options:
+  bot_token: ""
+  owner_id: 0
+  allowed_ids: []
+  menu_url: ""
+schema:
+  bot_token: password
+  owner_id: int
+  allowed_ids:
+    - int
+  menu_url: "str?"
