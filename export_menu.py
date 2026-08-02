@@ -11,9 +11,8 @@
 
 Требуется: pip install openpyxl
 """
-import openpyxl, json, os, glob, sys
+import openpyxl, json, os, glob, sys, re
 
-# папка кухни -> (ключ, заголовок для кнопки)
 CUISINES = [
     ("Japan", "japan", "Япония"),
     ("Italy", "italy", "Италия"),
@@ -22,9 +21,11 @@ CUISINES = [
     ("SouthAmerica", "south_america", "Южная Америка"),
 ]
 
+SOUP_KW = ["суп", "чиге", "том-кха", "минестроне", "мисо", "касуэла"]
+DESSERT_KW = ["десерт", "моти", "тирамису", "хотток", "манго", "альфахорес"]
+
 
 def find_xlsx(folder):
-    """Берём первый .xlsx в папке, игнорируя временные и lock-файлы."""
     for p in sorted(glob.glob(os.path.join(folder, "*.xlsx"))):
         b = os.path.basename(p)
         if b.startswith("~$") or b.startswith(".~"):
@@ -33,16 +34,33 @@ def find_xlsx(folder):
     raise FileNotFoundError(f"Не найден .xlsx в папке: {folder}")
 
 
+def dish_type(name):
+    low = (name or "").lower()
+    if any(k in low for k in SOUP_KW):
+        return "суп"
+    if any(k in low for k in DESSERT_KW):
+        return "десерт"
+    return "основное"
+
+
+def age_num(age_str):
+    m = re.search(r"\d+", str(age_str or ""))
+    return int(m.group()) if m else 0
+
+
 def dishes(folder):
     wb = openpyxl.load_workbook(find_xlsx(folder))
     out = []
     for ws in wb.worksheets:
-        hdr = itg = None
+        hdr = itg = cook = None
         for rr in range(1, ws.max_row + 1):
+            a = ws.cell(rr, 1).value
             if ws.cell(rr, 4).value == "Ккал":
                 hdr = rr
-            if ws.cell(rr, 1).value == "ИТОГО, ккал":
+            if a == "ИТОГО, ккал":
                 itg = rr
+            if a == "ПРИГОТОВЛЕНИЕ":
+                cook = rr
         if not hdr or not itg:
             continue
         ings = [
@@ -51,14 +69,28 @@ def dishes(folder):
         ]
         total = sum(ws.cell(rr, 4).value or 0 for rr in range(hdr + 1, itg))
         portions = ws["D2"].value or 1
+        # шаги приготовления
+        steps = []
+        if cook:
+            for rr in range(cook + 1, ws.max_row + 1):
+                a = ws.cell(rr, 1).value
+                b = ws.cell(rr, 2).value
+                if a and str(a).startswith("Шаг") and b and str(b).strip():
+                    steps.append(str(b).strip())
+        photo = ws["D5"].value  # имя файла фото (или пусто)
+        name = ws["A1"].value
         out.append({
-            "name": ws["A1"].value,
+            "name": name,
             "portions": portions,
             "time": ws["B3"].value,
             "spice": ws["B4"].value,
             "age": ws["D4"].value,
+            "age_num": age_num(ws["D4"].value),
+            "type": dish_type(name),
             "kcal_per_portion": round(total / portions),
+            "photo": (str(photo).strip() if photo else ""),
             "ingredients": ings,
+            "steps": steps,
         })
     wb.close()
     return out
