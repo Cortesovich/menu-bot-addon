@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Домашнее меню — Telegram-бот (v2).
+Домашнее меню — Telegram-бот (v1.2.0).
 
 Роли:
-  • Администратор  = owner_id (Роман): принимает/отклоняет заказы, пауза приёма, активные заказы.
-  • Пользователь   = allowed_ids: заказывает из меню / предлагает своё / отменяет свой заказ.
+  • Администратор = owner_id: приём/отклонение заказов, «Готово», пауза, активные заказы,
+    просмотр рецептов, одобрение регистраций.
+  • Пользователь  = allowed_ids (конфиг) ∪ одобренные через бота (в /data): заказ / своё / отмена.
+  • Незнакомец     — кнопка «Зарегистрироваться» → запрос админу.
 
-Long polling — внешний домен/порт не нужен.
-Конфиг: /data/options.json (HA add-on)  |  env  |  config.json (локально).
-Состояние (пауза, заказы) хранится в /data/state.json (или state.json локально).
+Long polling. Состояние (пауза, заказы, одобренные пользователи) — в /data/state.json.
 """
 import json, os, random, logging, datetime, urllib.request
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -23,14 +22,11 @@ from telegram.ext import (
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)  # не светить токен в логах
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("menu-bot")
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-NICE = [
-    "Отличный выбор! 😋", "Ммм, вкусно будет! 💛", "Супер, записал! ✨",
-    "Класс! Уже предвкушаю 🍽", "Прекрасный выбор 💛",
-]
+WD = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+NICE = ["Отличный выбор! 😋", "Ммм, вкусно будет! 💛", "Супер, записал! ✨", "Прекрасный выбор 💛"]
 
 
 # ----------------------------- конфиг -----------------------------
@@ -40,7 +36,6 @@ def load_config():
     if os.path.exists(ha):
         with open(ha, encoding="utf-8") as f:
             cfg.update(json.load(f))
-        log.info("Конфиг из Home Assistant")
     elif os.environ.get("BOT_TOKEN"):
         cfg["bot_token"] = os.environ.get("BOT_TOKEN", "")
         cfg["owner_id"] = int(os.environ.get("OWNER_ID", "0") or 0)
@@ -58,10 +53,10 @@ def load_config():
     return cfg
 
 
-def load_menu(menu_url):
-    if menu_url:
+def load_menu(url):
+    if url:
         try:
-            with urllib.request.urlopen(menu_url, timeout=15) as r:
+            with urllib.request.urlopen(url, timeout=15) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception as e:
             log.warning("Меню по ссылке не загрузилось (%s), беру локальное", e)
@@ -72,19 +67,19 @@ def load_menu(menu_url):
 CFG = load_config()
 MENU = load_menu(CFG["menu_url"])
 ADMIN = CFG["owner_id"]
-USERS = set(CFG["allowed_ids"]) | ({ADMIN} if ADMIN else set())
-
 STATE_PATH = "/data/state.json" if os.path.isdir("/data") else os.path.join(HERE, "state.json")
 
 
 def load_state():
+    st = {"paused": False, "next_id": 1, "orders": [], "approved": []}
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH, encoding="utf-8") as f:
-                return json.load(f)
+                st.update(json.load(f))
         except Exception:
             pass
-    return {"paused": False, "next_id": 1, "orders": []}
+    st.setdefault("approved", [])
+    return st
 
 
 def save_state():
@@ -96,27 +91,30 @@ def save_state():
 
 
 STATE = load_state()
-PENDING = {}  # uid -> {"type": ...}
+PENDING = {}
 
 
 # ----------------------------- роли -----------------------------
+def allowed_set():
+    return set(CFG["allowed_ids"]) | set(STATE.get("approved", []))
+
+
 def role(uid):
+    base = allowed_set() | ({ADMIN} if ADMIN else set())
     if ADMIN and uid == ADMIN:
         return "admin"
-    if not USERS or uid in USERS:
+    if not base:
         return "user"
-    return None
+    return "user" if uid in base else None
 
 
 # ----------------------------- клавиатуры -----------------------------
-USER_KB = ReplyKeyboardMarkup(
-    [["🍽 Заказать из меню"], ["✍️ Предложить своё"], ["❌ Отменить заказ"]],
-    resize_keyboard=True,
-)
+USER_KB = ReplyKeyboardMarkup([["🍽 Заказать из меню"], ["✍️ Предложить своё"], ["❌ Отменить заказ"]], resize_keyboard=True)
 ADMIN_KB = ReplyKeyboardMarkup(
-    [["⏸ Приостановить приём", "▶️ Возобновить приём"], ["📋 Активные заказы"]],
+    [["⏸ Приостановить приём", "▶️ Возобновить приём"], ["📖 Рецепты", "📋 Активные заказы"]],
     resize_keyboard=True,
 )
+RESET_BTNS = ("🍽", "✍️", "❌", "⏸", "▶️", "📖", "📋")
 
 
 def filters_kb():
@@ -141,22 +139,33 @@ def dishlist_kb(pairs):
     return InlineKeyboardMarkup(rows)
 
 
-def card_kb(ci, di):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Выбрать дату", callback_data=f"pick:{ci}:{di}")],
-        [InlineKeyboardButton("« Назад", callback_data="home")],
-    ])
+def card_kb(ci, di, admin=False):
+    if admin:
+        top = InlineKeyboardButton("📖 Вывести рецепт", callback_data=f"rshow:{ci}:{di}")
+    else:
+        top = InlineKeyboardButton("📅 Выбрать дату", callback_data=f"pick:{ci}:{di}")
+    return InlineKeyboardMarkup([[top], [InlineKeyboardButton("« Назад", callback_data="home")]])
 
 
-def date_kb(prefix):
+def date_kb(prefix, days=14):
     t = datetime.date.today()
-    tm = t + datetime.timedelta(days=1)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Сегодня ({t.strftime('%d.%m')})", callback_data=f"{prefix}:today")],
-        [InlineKeyboardButton(f"Завтра ({tm.strftime('%d.%m')})", callback_data=f"{prefix}:tomorrow")],
-        [InlineKeyboardButton("Другая дата", callback_data=f"{prefix}:other")],
-        [InlineKeyboardButton("« Назад", callback_data="home")],
-    ])
+    rows, row = [], []
+    for off in range(days):
+        d = t + datetime.timedelta(days=off)
+        if off == 0:
+            lbl = f"Сегодня {d.strftime('%d.%m')}"
+        elif off == 1:
+            lbl = f"Завтра {d.strftime('%d.%m')}"
+        else:
+            lbl = f"{WD[d.weekday()]} {d.strftime('%d.%m')}"
+        row.append(InlineKeyboardButton(lbl, callback_data=f"{prefix}:{off}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Другая дата", callback_data=f"{prefix}:o")])
+    rows.append([InlineKeyboardButton("« Назад", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ----------------------------- утилиты -----------------------------
@@ -177,19 +186,27 @@ def card_text(cuisine, d):
     return "\n".join(lines)
 
 
+def steps_text(title, steps):
+    lines = [f"📖 <b>{title}</b> — приготовление:"]
+    for i, s in enumerate(steps, 1):
+        lines.append(f"{i}. {s}")
+    return "\n".join(lines)
+
+
 def photo_url(d):
     p = d.get("photo") or ""
     base = CFG.get("photo_base_url") or ""
-    if p and base:
-        return base.rstrip("/") + "/" + p
-    return None
+    return (base.rstrip("/") + "/" + p) if (p and base) else None
+
+
+def date_from_off(off):
+    return (datetime.date.today() + datetime.timedelta(days=int(off))).strftime("%d.%m.%Y")
 
 
 def parse_date(text):
-    text = text.strip()
     for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d.%m"):
         try:
-            dt = datetime.datetime.strptime(text, fmt).date()
+            dt = datetime.datetime.strptime(text.strip(), fmt).date()
             if fmt == "%d.%m":
                 dt = dt.replace(year=datetime.date.today().year)
             return dt.strftime("%d.%m.%Y")
@@ -199,18 +216,13 @@ def parse_date(text):
 
 
 def new_order(user, kind, title, cuisine, ingredients, steps, photo, date):
-    oid = STATE["next_id"]
-    STATE["next_id"] += 1
-    order = {
-        "id": oid, "user_id": user.id, "user_name": user.first_name or "Пользователь",
-        "kind": kind, "title": title, "cuisine": cuisine,
-        "ingredients": ingredients, "steps": steps, "photo": photo,
-        "date": date, "status": "new", "reason": "",
-        "created": datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
-    }
-    STATE["orders"].append(order)
-    save_state()
-    return order
+    oid = STATE["next_id"]; STATE["next_id"] += 1
+    o = {"id": oid, "user_id": user.id, "user_name": user.first_name or "Пользователь",
+         "kind": kind, "title": title, "cuisine": cuisine, "ingredients": ingredients,
+         "steps": steps, "photo": photo, "date": date, "status": "new", "reason": "",
+         "created": datetime.datetime.now().strftime("%d.%m.%Y %H:%M")}
+    STATE["orders"].append(o); save_state()
+    return o
 
 
 def find_order(oid):
@@ -220,10 +232,8 @@ def find_order(oid):
     return None
 
 
-# ----------------------------- отправка заказа админу -----------------------------
 async def send_to_admin(ctx, order):
     if not ADMIN:
-        log.warning("owner_id не задан — заказ не отправить")
         return
     text = f"🆕 <b>{order['date']}</b> готовим «{order['title']}», заказ {order['user_name']}"
     if order["kind"] == "custom":
@@ -242,70 +252,81 @@ async def send_to_admin(ctx, order):
         log.error("Не отправить заказ админу: %s", e)
 
 
-# ----------------------------- хендлеры -----------------------------
+# ----------------------------- команды -----------------------------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    r = role(uid)
+    u = update.effective_user
+    r = role(u.id)
     if r is None:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Зарегистрироваться", callback_data="reg")]])
         await update.message.reply_text(
-            f"Извините, доступ ограничён.\nВаш Telegram ID: {uid}\nПередайте его владельцу."
-        )
+            "Здравствуйте! Доступ к боту выдаёт владелец.\nНажмите «Зарегистрироваться», чтобы отправить запрос.",
+            reply_markup=kb)
         return
     if r == "admin":
         st = "приостановлен ⏸" if STATE["paused"] else "включён ▶️"
         await update.message.reply_text(f"Панель администратора. Приём заказов: {st}.", reply_markup=ADMIN_KB)
     else:
-        name = update.effective_user.first_name or "привет"
         await update.message.reply_text(
-            f"{name}, привет! 💛\nВыбери, что приготовить — я передам Роме.", reply_markup=USER_KB
-        )
+            f"{u.first_name or 'Привет'}, привет! 💛\nВыбери, что приготовить — я передам Роме.",
+            reply_markup=USER_KB)
 
 
+async def finalize_menu_order(uid, user, ctx, ci, di, date):
+    d = dish_at(ci, di); cuisine = MENU["cuisines"][ci]["title"]
+    o = new_order(user, "menu", d["name"], cuisine, d["ingredients"], d.get("steps", []), d.get("photo", ""), date)
+    await ctx.bot.send_message(uid, f"{random.choice(NICE)}\nЗаказ «{d['name']}» на {date} отправлен. Ждём подтверждения.")
+    await send_to_admin(ctx, o)
+
+
+async def finalize_custom_order(uid, user, ctx, txt, date):
+    o = new_order(user, "custom", txt, "", [], [], "", date)
+    await ctx.bot.send_message(uid, f"{random.choice(NICE)}\nЗаявка «{txt}» на {date} отправлена. Ждём подтверждения.")
+    await send_to_admin(ctx, o)
+
+
+# ----------------------------- текстовые сообщения -----------------------------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    u = update.effective_user; uid = u.id
     r = role(uid)
     if r is None:
+        await update.message.reply_text("Доступ не выдан. Наберите /start и нажмите «Зарегистрироваться».")
         return
     text = (update.message.text or "").strip()
 
-    # ожидание ввода (причина отклонения / текст своего заказа / дата)
+    # нижние кнопки всегда сбрасывают режим ввода
+    if any(text.startswith(p) for p in RESET_BTNS):
+        PENDING.pop(uid, None)
+
     pend = PENDING.get(uid)
     if pend:
-        if pend["type"] == "reject":
-            o = find_order(pend["order_id"])
-            PENDING.pop(uid, None)
+        t = pend["type"]
+        if t == "reject":
+            o = find_order(pend["order_id"]); PENDING.pop(uid, None)
             if o and o["status"] == "new":
                 o["status"] = "rejected"; o["reason"] = text; save_state()
-                await ctx.bot.send_message(o["user_id"],
-                    f"❌ Ваш заказ «{o['title']}» на {o['date']} отклонён.\nПричина: {text}")
-                await update.message.reply_text("Отклонено, пользователю отправил причину.")
+                await ctx.bot.send_message(o["user_id"], f"❌ Заказ «{o['title']}» на {o['date']} отклонён.\nПричина: {text}")
+                await update.message.reply_text("Отклонено, причину пользователю отправил.")
             else:
                 await update.message.reply_text("Заказ уже обработан.")
             return
-        if pend["type"] == "custom_text":
+        if t == "custom_text":
             PENDING[uid] = {"type": "custom_date", "text": text}
-            await update.message.reply_text(
-                f"Заявка: «{text}».\nНа какую дату приготовить?", reply_markup=date_kb("dc"))
+            await update.message.reply_text(f"Заявка: «{text}».\nНа какую дату приготовить?", reply_markup=date_kb("dc"))
             return
-        if pend["type"] == "await_date":
+        if t in ("await_date", "await_date_custom"):
             ds = parse_date(text)
             if not ds:
                 await update.message.reply_text("Не понял дату. Введите как ДД.ММ.ГГГГ, например 12.08.2026.")
                 return
-            ci, di = pend["ci"], pend["di"]
-            PENDING.pop(uid, None)
-            await finalize_menu_order(update, ctx, ci, di, ds)
-            return
-        if pend["type"] == "await_date_custom":
-            ds = parse_date(text)
-            if not ds:
-                await update.message.reply_text("Не понял дату. Введите как ДД.ММ.ГГГГ.")
-                return
-            txt = pend["text"]; PENDING.pop(uid, None)
-            await finalize_custom_order(update, ctx, txt, ds)
+            if t == "await_date":
+                ci, di = pend["ci"], pend["di"]; PENDING.pop(uid, None)
+                await finalize_menu_order(uid, u, ctx, ci, di, ds)
+            else:
+                txt = pend["text"]; PENDING.pop(uid, None)
+                await finalize_custom_order(uid, u, ctx, txt, ds)
             return
 
-    # админские кнопки
+    # админ
     if r == "admin":
         if text.startswith("⏸"):
             STATE["paused"] = True; save_state()
@@ -313,18 +334,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if text.startswith("▶️"):
             STATE["paused"] = False; save_state()
             await update.message.reply_text("Приём заказов возобновлён ▶️", reply_markup=ADMIN_KB); return
+        if text.startswith("📖"):
+            await update.message.reply_text("Просмотр рецептов — выбери:", reply_markup=filters_kb()); return
         if text.startswith("📋"):
-            active = [o for o in STATE["orders"] if o["status"] in ("new", "confirmed")]
-            if not active:
-                await update.message.reply_text("Активных заказов нет."); return
-            lines = ["<b>Активные заказы:</b>"]
-            for o in active:
-                lines.append(f"#{o['id']} · {o['date']} · «{o['title']}» — {o['user_name']} [{o['status']}]")
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML"); return
-        await update.message.reply_text("Кнопки внизу: пауза/возобновление и активные заказы.", reply_markup=ADMIN_KB)
-        return
+            await show_active(update, ctx); return
+        await update.message.reply_text("Кнопки внизу.", reply_markup=ADMIN_KB); return
 
-    # пользовательские кнопки
+    # пользователь
     if text.startswith("🍽"):
         if STATE["paused"]:
             await update.message.reply_text("К сожалению, в данный момент заказы не принимаются."); return
@@ -338,41 +354,54 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         mine = [o for o in STATE["orders"] if o["user_id"] == uid and o["status"] in ("new", "confirmed")]
         if not mine:
             await update.message.reply_text("У вас нет активных заказов."); return
-        rows = [[InlineKeyboardButton(f"Отменить «{o['title']}» ({o['date']})", callback_data=f"cancel:{o['id']}")]
-                for o in mine]
-        await update.message.reply_text("Ваши активные заказы:", reply_markup=InlineKeyboardMarkup(rows)); return
+        rows = [[InlineKeyboardButton(f"{i}. {o['title']} ({o['date']})", callback_data=f"cancel:{o['id']}")]
+                for i, o in enumerate(mine, 1)]
+        await update.message.reply_text("Ваши заказы — что отменить?", reply_markup=InlineKeyboardMarkup(rows)); return
 
     await update.message.reply_text("Выберите действие кнопками внизу.", reply_markup=USER_KB)
 
 
-async def finalize_menu_order(update, ctx, ci, di, date):
-    d = dish_at(ci, di)
-    cuisine = MENU["cuisines"][ci]["title"]
-    order = new_order(update.effective_user, "menu", d["name"], cuisine,
-                      d["ingredients"], d.get("steps", []), d.get("photo", ""), date)
-    await ctx.bot.send_message(update.effective_user.id,
-        f"{random.choice(NICE)}\nЗаказ «{d['name']}» на {date} отправлен. Ждём подтверждения.")
-    await send_to_admin(ctx, order)
+async def show_active(update, ctx):
+    active = [o for o in STATE["orders"] if o["status"] in ("new", "confirmed")]
+    if not active:
+        await update.message.reply_text("Активных заказов нет."); return
+    lines = ["<b>Активные заказы:</b>"]
+    rows = []
+    for o in active:
+        lines.append(f"#{o['id']} · {o['date']} · «{o['title']}» — {o['user_name']} [{o['status']}]")
+        if o["status"] == "confirmed":
+            rows.append([InlineKeyboardButton(f"✅ Готово: {o['title']}", callback_data=f"done:{o['id']}")])
+    kb = InlineKeyboardMarkup(rows) if rows else None
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
 
-async def finalize_custom_order(update, ctx, txt, date):
-    order = new_order(update.effective_user, "custom", txt, "", [], [], "", date)
-    await ctx.bot.send_message(update.effective_user.id,
-        f"{random.choice(NICE)}\nЗаявка «{txt}» на {date} отправлена. Ждём подтверждения.")
-    await send_to_admin(ctx, order)
-
-
+# ----------------------------- инлайн-кнопки -----------------------------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
+    u = q.from_user; uid = u.id
+    data = q.data
+
+    # регистрация — доступна незнакомцу
+    if data == "reg":
+        if role(uid) is not None:
+            await q.edit_message_text("У вас уже есть доступ. Наберите /start."); return
+        await q.edit_message_text("Запрос отправлен. Ожидайте подтверждения ⏳")
+        if ADMIN:
+            uname = f"@{u.username}" if u.username else "—"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{uid}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"deny:{uid}"),
+            ]])
+            await ctx.bot.send_message(ADMIN, f"📝 Запрос доступа: {u.first_name or '—'} ({uname}, ID {uid})", reply_markup=kb)
+        return
+
     r = role(uid)
     if r is None:
         return
-    data = q.data
 
     if data == "home":
-        await q.edit_message_text("Как выбрать блюдо?", reply_markup=filters_kb()); return
+        await q.edit_message_text("Выбери:", reply_markup=filters_kb()); return
     if data == "f:cuisines":
         await q.edit_message_text("Выбери кухню:", reply_markup=cuisines_kb()); return
     if data == "f:kids":
@@ -392,7 +421,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("d:"):
         _, ci, di = data.split(":"); ci, di = int(ci), int(di)
         d = dish_at(ci, di); cuisine = MENU["cuisines"][ci]["title"]
-        await q.edit_message_text(card_text(cuisine, d), parse_mode="HTML", reply_markup=card_kb(ci, di))
+        await q.edit_message_text(card_text(cuisine, d), parse_mode="HTML", reply_markup=card_kb(ci, di, admin=(r == "admin")))
         ph = photo_url(d)
         if ph:
             try:
@@ -401,37 +430,59 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning("Фото не отправилось: %s", e)
         return
 
+    if data.startswith("rshow:"):
+        _, ci, di = data.split(":"); d = dish_at(int(ci), int(di))
+        if d.get("steps"):
+            await ctx.bot.send_message(uid, steps_text(d["name"], d["steps"]), parse_mode="HTML")
+        else:
+            await ctx.bot.send_message(uid, "Рецепт этого блюда пока не заполнен.")
+        return
+
     if data.startswith("pick:"):
         _, ci, di = data.split(":")
         await q.edit_message_text("На какую дату приготовить?", reply_markup=date_kb(f"dm:{ci}:{di}")); return
 
-    # дата для блюда из меню: dm:ci:di:today|tomorrow|other
     if data.startswith("dm:"):
-        _, ci, di, when = data.split(":"); ci, di = int(ci), int(di)
-        if when == "other":
+        _, ci, di, tok = data.split(":"); ci, di = int(ci), int(di)
+        if tok == "o":
             PENDING[uid] = {"type": "await_date", "ci": ci, "di": di}
             await q.edit_message_text("Введите дату сообщением: ДД.ММ.ГГГГ (например 12.08.2026)."); return
-        ds = date_from_when(when)
+        ds = date_from_off(tok)
         await q.edit_message_text(f"Готовим «{dish_at(ci,di)['name']}» на {ds}. Отправляю Роме ✅")
-        await finalize_menu_order(update, ctx, ci, di, ds); return
+        await finalize_menu_order(uid, u, ctx, ci, di, ds); return
 
-    # дата для своего заказа: dc:today|tomorrow|other
     if data.startswith("dc:"):
-        when = data.split(":")[1]
-        pend = PENDING.get(uid)
-        if not pend or pend.get("type") not in ("custom_date",):
+        tok = data.split(":")[1]; pend = PENDING.get(uid)
+        if not pend or pend.get("type") != "custom_date":
             await q.edit_message_text("Заявка не найдена, начните заново."); return
-        if when == "other":
+        if tok == "o":
             PENDING[uid] = {"type": "await_date_custom", "text": pend["text"]}
             await q.edit_message_text("Введите дату сообщением: ДД.ММ.ГГГГ."); return
-        ds = date_from_when(when); txt = pend["text"]; PENDING.pop(uid, None)
+        ds = date_from_off(tok); txt = pend["text"]; PENDING.pop(uid, None)
         await q.edit_message_text(f"Заявка «{txt}» на {ds} отправлена ✅")
-        await finalize_custom_order(update, ctx, txt, ds); return
+        await finalize_custom_order(uid, u, ctx, txt, ds); return
 
-    # админ: подтвердить
-    if data.startswith("ok:"):
-        if r != "admin":
-            return
+    # --- админские действия ---
+    if data.startswith("approve:") and r == "admin":
+        tid = int(data.split(":")[1])
+        if tid not in STATE["approved"]:
+            STATE["approved"].append(tid); save_state()
+        await q.edit_message_text(f"✅ Пользователь {tid} одобрен.")
+        try:
+            await ctx.bot.send_message(tid, "✅ Доступ открыт! Нажмите /start.")
+        except Exception:
+            pass
+        return
+    if data.startswith("deny:") and r == "admin":
+        tid = int(data.split(":")[1])
+        await q.edit_message_text(f"❌ Запрос {tid} отклонён.")
+        try:
+            await ctx.bot.send_message(tid, "К сожалению, доступ не выдан.")
+        except Exception:
+            pass
+        return
+
+    if data.startswith("ok:") and r == "admin":
         o = find_order(int(data.split(":")[1]))
         if not o or o["status"] != "new":
             await q.edit_message_reply_markup(None); return
@@ -440,33 +491,26 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text((q.message.text or q.message.caption or "") + "\n\n✅ Подтверждено")
         except Exception:
             pass
-        # состав + рецепт — только админу
         lines = [f"🍽 <b>{o['title']}</b> · {o['date']}"]
         if o["ingredients"]:
-            lines.append(""); lines.append("<b>Ингредиенты:</b>")
-            for ing in o["ingredients"]:
-                lines.append(f"• {ing['name']} — {ing['amount']}")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📖 Вывести рецепт", callback_data=f"recipe:{o['id']}")]]) if o["steps"] else None
-        await ctx.bot.send_message(ADMIN, "\n".join(lines), parse_mode="HTML", reply_markup=kb)
+            lines += ["", "<b>Ингредиенты:</b>"] + [f"• {i['name']} — {i['amount']}" for i in o["ingredients"]]
+        btns = []
+        if o["steps"]:
+            btns.append(InlineKeyboardButton("📖 Вывести рецепт", callback_data=f"recipe:{o['id']}"))
+        btns.append(InlineKeyboardButton("✅ Готово", callback_data=f"done:{o['id']}"))
+        await ctx.bot.send_message(ADMIN, "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([btns]))
         await ctx.bot.send_message(o["user_id"], f"✅ Ваш заказ «{o['title']}» на {o['date']} подтверждён!")
         return
 
-    # админ: отклонить -> запрос причины
-    if data.startswith("no:"):
-        if r != "admin":
-            return
+    if data.startswith("no:") and r == "admin":
         oid = int(data.split(":")[1]); o = find_order(oid)
         if not o or o["status"] != "new":
             await q.edit_message_reply_markup(None); return
         PENDING[uid] = {"type": "reject", "order_id": oid}
-        await q.edit_message_reply_markup(
-            InlineKeyboardMarkup([[InlineKeyboardButton("Без причины", callback_data=f"noskip:{oid}")]]))
+        await q.edit_message_reply_markup(InlineKeyboardMarkup([[InlineKeyboardButton("Без причины", callback_data=f"noskip:{oid}")]]))
         await ctx.bot.send_message(ADMIN, "Напишите причину отклонения одним сообщением (или «Без причины»).")
         return
-
-    if data.startswith("noskip:"):
-        if r != "admin":
-            return
+    if data.startswith("noskip:") and r == "admin":
         o = find_order(int(data.split(":")[1])); PENDING.pop(uid, None)
         if o and o["status"] == "new":
             o["status"] = "rejected"; save_state()
@@ -474,16 +518,29 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_reply_markup(None)
         return
 
+    if data.startswith("done:") and r == "admin":
+        o = find_order(int(data.split(":")[1]))
+        if not o or o["status"] != "confirmed":
+            await q.edit_message_reply_markup(None); return
+        o["status"] = "done"; save_state()
+        try:
+            await q.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        await ctx.bot.send_message(ADMIN, f"Заказ «{o['title']}» на {o['date']} отмечен выполненным ✅")
+        try:
+            await ctx.bot.send_message(o["user_id"], f"🍽 Ваш заказ «{o['title']}» готов! Приятного аппетита 💛")
+        except Exception:
+            pass
+        return
+
     if data.startswith("recipe:"):
         o = find_order(int(data.split(":")[1]))
         if not o or not o["steps"]:
             await ctx.bot.send_message(uid, "Рецепт пока не заполнен."); return
-        lines = [f"📖 <b>{o['title']}</b> — приготовление:"]
-        for i, s in enumerate(o["steps"], 1):
-            lines.append(f"{i}. {s}")
-        await ctx.bot.send_message(uid, "\n".join(lines), parse_mode="HTML"); return
+        await ctx.bot.send_message(uid, steps_text(o["title"], o["steps"]), parse_mode="HTML"); return
 
-    # пользователь: отмена своего заказа
+    # --- отмена пользователем ---
     if data.startswith("cancel:"):
         o = find_order(int(data.split(":")[1]))
         if not o or o["user_id"] != uid or o["status"] not in ("new", "confirmed"):
@@ -495,19 +552,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 
-def date_from_when(when):
-    t = datetime.date.today()
-    if when == "tomorrow":
-        t = t + datetime.timedelta(days=1)
-    return t.strftime("%d.%m.%Y")
-
-
 def main():
     if not CFG["bot_token"]:
         raise SystemExit("Не задан bot_token.")
-    log.info("Меню: %d кухонь, %d блюд. Админ: %s. Пользователи: %s. Пауза: %s",
-             len(MENU["cuisines"]), sum(len(c["dishes"]) for c in MENU["cuisines"]),
-             ADMIN or "—", sorted(USERS) or "все", STATE["paused"])
+    log.info("Меню: %d блюд. Админ: %s. Доступ: %s. Пауза: %s",
+             sum(len(c["dishes"]) for c in MENU["cuisines"]), ADMIN or "—",
+             sorted(allowed_set()) or "все", STATE["paused"])
     app = Application.builder().token(CFG["bot_token"]).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))

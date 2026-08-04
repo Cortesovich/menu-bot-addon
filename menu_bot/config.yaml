@@ -1,5 +1,5 @@
 name: "Домашнее меню — бот"
-version: "1.1.0"
+version: "1.2.0"
 slug: menu_bot
 image: "ghcr.io/cortesovich/menu-bot-{arch}"
 description: "Телеграм-бот домашнего меню: жена выбирает кухню и блюдо, владельцу приходит название и список ингредиентов."
